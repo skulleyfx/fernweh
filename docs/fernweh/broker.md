@@ -241,7 +241,7 @@ An optional small picture per host, shown on the client's host cards. Off unless
 `[thumbnails] directory` is set.
 
 - The file is `<directory>/<short host name in lower case>.png` (for
-  `ws01.example.org`: `ws01.png`). The broker only reads the directory; whatever
+  `host1.example.org`: `host1.png`). The broker only reads the directory; whatever
   writes the files should write a temporary file and rename it into place.
 - Accepted: a regular file (symlinks are not followed) of at most 128 KiB with a
   PNG signature and an IHDR chunk whose width and height are both 16 to 256
