@@ -49,6 +49,8 @@ RemoveIPC=yes
 SystemCallArchitectures=native
 SystemCallFilter=@system-service
 SystemCallFilter=~@privileged @resources
+# Allow chown only, so the broker can give the admin socket to its socket_group.
+SystemCallFilter=@chown
 SystemCallErrorNumber=EPERM
 # INET for clients/KDC/LDAP/hosts, UNIX for the relay socket and journald,
 # NETLINK for glibc getaddrinfo(AI_ADDRCONFIG) used by libkrb5.

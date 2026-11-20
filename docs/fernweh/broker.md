@@ -218,6 +218,8 @@ An optional, read-only status API for a local admin page. It is off unless
   `SupplementaryGroups=plank-admin-api` and `RuntimeDirectory=plank-broker-admin`
   (mode 0750) so it may do that; add the API user to the group. The group is
   created by the shipped `sysusers.d` file.
+  The unit's syscall filter otherwise blocks `fchown`, so it allows the `@chown`
+  group (and nothing else privileged) for this purpose.
 - A socket or a user that cannot be set up stops the broker at start-up instead
   of leaving the feature silently off.
 
