@@ -4,6 +4,7 @@
 //! * `plank-broker` — unprivileged public API (login, host list, connect).
 //! * `plank-broker-relay` — CAP_NET_ADMIN helper owning the nftables DNAT leases.
 
+pub mod ad;
 pub mod api;
 pub mod audit;
 pub mod broker;
@@ -32,6 +33,8 @@ pub mod util;
 
 #[cfg(test)]
 mod tests;
+#[cfg(test)]
+mod tests_ad;
 #[cfg(test)]
 mod tests_enrol;
 

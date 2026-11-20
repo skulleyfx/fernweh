@@ -21,6 +21,12 @@ pub struct Config {
     pub tls: TlsConfig,
     pub kerberos: KerberosConfig,
     pub ldap: LdapConfig,
+    /// Which directory backs sign-in and host assignment (default FreeIPA).
+    #[serde(default)]
+    pub directory: DirectoryConfig,
+    /// Active Directory backend settings (used when `directory.backend = "ad"`).
+    #[serde(default)]
+    pub ad: AdConfig,
     #[serde(default)]
     pub hosts: HostsConfig,
     /// Explicit broker-trusted admission for unjoined, shared macOS desktops.
@@ -42,6 +48,92 @@ pub struct Config {
     /// Beta-only diagnostic collection, disabled unless explicitly configured.
     #[serde(default)]
     pub diagnostics: Option<crate::diagnostics::Config>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize, Default)]
+#[serde(rename_all = "lowercase")]
+pub enum DirectoryBackend {
+    /// FreeIPA: HBAC rules, OTP tokens, enrolment (the upstream behaviour).
+    #[default]
+    Freeipa,
+    /// Active Directory: password-only Kerberos sign-in, access by `PLANK-*` groups.
+    Ad,
+}
+
+#[derive(Debug, Clone, Default, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct DirectoryConfig {
+    #[serde(default)]
+    pub backend: DirectoryBackend,
+}
+
+/// Active Directory backend (`directory.backend = "ad"`, this fork).
+///
+/// Inventory: computer accounts that are (possibly nested) members of
+/// `hosts_group`. Access: a user may reach host `H` when a member (possibly
+/// nested, resolved by the DC with LDAP_MATCHING_RULE_IN_CHAIN) of the group
+/// `<access_group_prefix><H>` or of `all_hosts_group`.
+#[derive(Debug, Clone, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct AdConfig {
+    /// Computer group listing the PLANK hosts (name, not DN).
+    #[serde(default = "d_ad_hosts_group")]
+    pub hosts_group: String,
+    /// Per-host access groups are `<prefix><computer name>` (e.g. `PLANK-WS01`).
+    #[serde(default = "d_ad_prefix")]
+    pub access_group_prefix: String,
+    /// Members of this group reach every host in `hosts_group`.
+    #[serde(default = "d_ad_all_hosts")]
+    pub all_hosts_group: String,
+    /// Search base for users; default `ldap.base_dn` (derived from the realm).
+    #[serde(default)]
+    pub user_base: Option<String>,
+    /// Search base for computers; default `ldap.base_dn`.
+    #[serde(default)]
+    pub computer_base: Option<String>,
+    /// OU (DN) holding the PLANK security groups. Required: only groups under it count, so
+    /// a same-named group elsewhere in the domain cannot grant access.
+    #[serde(default)]
+    pub groups_base: Option<String>,
+    /// The domain's account lockout threshold and observation window (seconds). When given,
+    /// the broker's limits are checked against them at start-up.
+    #[serde(default)]
+    pub lockout_threshold: Option<u32>,
+    #[serde(default)]
+    pub lockout_window_secs: Option<u64>,
+    /// Safety margin added to the observation window before the broker treats a user's
+    /// directory counter as reset.
+    #[serde(default = "d_60u64")]
+    pub lockout_margin_secs: u64,
+    /// Optional fixed IPv4 address per host FQDN (lower case); otherwise the
+    /// broker resolves the host's `dNSHostName` through the system resolver.
+    #[serde(default)]
+    pub host_ipv4: std::collections::HashMap<String, std::net::Ipv4Addr>,
+}
+
+impl Default for AdConfig {
+    fn default() -> Self {
+        toml::from_str("").unwrap()
+    }
+}
+
+fn d_ad_hosts_group() -> String {
+    "PLANK-Hosts".into()
+}
+fn d_ad_prefix() -> String {
+    "PLANK-".into()
+}
+fn d_ad_all_hosts() -> String {
+    "PLANK-AllHosts".into()
+}
+
+/// A group name usable in an LDAP filter and a DN lookup without escaping surprises.
+pub fn valid_ad_group_name(n: &str) -> bool {
+    !n.is_empty()
+        && n.len() <= 64
+        && n.chars().all(|c| c.is_ascii_alphanumeric() || matches!(c, '-' | '_' | '.' | ' '))
+        && !n.starts_with(' ')
+        && !n.ends_with(' ')
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -83,6 +175,17 @@ pub struct KerberosConfig {
     /// Must be private to the broker (the systemd StateDirectory).
     #[serde(default = "d_session_dir")]
     pub session_dir: PathBuf,
+    /// Plain password AS exchange: no OTP pre-auth list and no FAST armour.
+    /// Required for Active Directory (`directory.backend = "ad"`).
+    #[serde(default)]
+    pub password_only: bool,
+    /// Active Directory: service principal in the keytab used to verify that the KDC's
+    /// answer is genuine (`krb5_verify_init_creds`), e.g. `host/<broker fqdn>@REALM`.
+    #[serde(default)]
+    pub verify_principal: Option<String>,
+    /// How long `auth/respond` waits for the KDC. The attempt is counted whatever its outcome.
+    #[serde(default = "d_10secs")]
+    pub login_timeout_secs: u64,
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -122,6 +225,69 @@ pub struct HostsConfig {
     /// TOFU host certificate pins.
     #[serde(default = "d_pins")]
     pub pins_file: PathBuf,
+    /// How hosts are probed. Only `tls` exists: a TLS 1.3 handshake without a
+    /// client certificate, then the leaf certificate hash is checked.
+    #[serde(default)]
+    pub probe_mode: ProbeMode,
+    /// Static pins (`fqdn = "<sha256 hex of the leaf certificate DER>"`). A host
+    /// listed here is never TOFU-pinned; any other certificate marks it changed.
+    #[serde(default)]
+    pub static_pins: std::collections::HashMap<String, String>,
+    /// Host admission at `connect`: one value for every host (`"gssapi"` or
+    /// `"none"`) or a table of fqdn -> value. `none` returns an empty
+    /// `gssapi_token` (`auth_method: "host_login"`): the Host does its own sign-in.
+    #[serde(default)]
+    pub admission: AdmissionPolicy,
+    /// Hosts missing from a per-host `admission` table.
+    #[serde(default)]
+    pub default_admission: Admission,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize, Default)]
+#[serde(rename_all = "lowercase")]
+pub enum ProbeMode {
+    #[default]
+    Tls,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize, Default)]
+#[serde(rename_all = "lowercase")]
+pub enum Admission {
+    /// The broker obtains a GSSAPI AP-REQ for `plank@<fqdn>` (FreeIPA hosts).
+    #[default]
+    Gssapi,
+    /// No broker admission token; the host authenticates the client itself.
+    None,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+#[serde(untagged)]
+pub enum AdmissionPolicy {
+    All(Admission),
+    PerHost(std::collections::HashMap<String, Admission>),
+}
+
+impl Default for AdmissionPolicy {
+    fn default() -> Self {
+        AdmissionPolicy::PerHost(Default::default())
+    }
+}
+
+impl HostsConfig {
+    pub fn admission_for(&self, fqdn: &str) -> Admission {
+        match &self.admission {
+            AdmissionPolicy::All(a) => *a,
+            AdmissionPolicy::PerHost(m) => m.get(fqdn).copied().unwrap_or(self.default_admission),
+        }
+    }
+
+    /// The admission used by every host not named explicitly.
+    pub fn base_admission(&self) -> Admission {
+        match &self.admission {
+            AdmissionPolicy::All(a) => *a,
+            AdmissionPolicy::PerHost(_) => self.default_admission,
+        }
+    }
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -254,6 +420,16 @@ pub struct Limits {
     pub failures_per_user_ip: u32,
     #[serde(default = "d_10")]
     pub failures_per_ip: u32,
+    /// Wrong passwords per user name, from ANY address, per quiet period before that user is
+    /// refused (protects the directory's own account lockout; see `ratelimit.rs`). 0 disables
+    /// it; required (> 0, and below `ad.lockout_threshold`) for Active Directory.
+    #[serde(default)]
+    pub failures_per_user: u32,
+    /// Quiet period after which a user's failure count resets (non-AD backends). With
+    /// `directory.backend = "ad"` it is `ad.lockout_window_secs + ad.lockout_margin_secs`
+    /// instead and this value is ignored.
+    #[serde(default = "d_1800")]
+    pub user_window_secs: u64,
     #[serde(default = "d_900")]
     pub block_secs: u64,
     #[serde(default = "d_20")]
@@ -406,6 +582,15 @@ fn d_900() -> u64 {
 }
 fn d_1500() -> u64 {
     1500
+}
+fn d_60u64() -> u64 {
+    60
+}
+fn d_10secs() -> u64 {
+    10
+}
+fn d_1800() -> u64 {
+    1800
 }
 fn d_3600() -> u64 {
     3600
@@ -602,6 +787,101 @@ impl Config {
         }
         if self.public_endpoint.is_empty() || !crate::util::valid_hostname(&self.public_endpoint) {
             bail!("public_endpoint must be a host name");
+        }
+        for (h, pin) in &self.hosts.static_pins {
+            if !crate::util::valid_hostname(h) || h != &h.to_ascii_lowercase() {
+                bail!("hosts.static_pins: {h} is not a lower-case host name");
+            }
+            if pin.len() != 64 || !pin.bytes().all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b)) {
+                bail!("hosts.static_pins: {h}: expected 64 lower-case hex digits (SHA-256 of the certificate DER)");
+            }
+        }
+        if let AdmissionPolicy::PerHost(m) = &self.hosts.admission {
+            for h in m.keys() {
+                if !crate::util::valid_hostname(h) || h != &h.to_ascii_lowercase() {
+                    bail!("hosts.admission: {h} is not a lower-case host name");
+                }
+            }
+        }
+        if self.directory.backend == DirectoryBackend::Ad {
+            self.validate_ad()?;
+        } else if self.kerberos.password_only {
+            bail!("kerberos.password_only is only valid with directory.backend = \"ad\"");
+        }
+        Ok(())
+    }
+}
+
+impl Config {
+    fn validate_ad(&self) -> Result<()> {
+        let a = &self.ad;
+        for (what, n) in [
+            ("ad.hosts_group", &a.hosts_group),
+            ("ad.all_hosts_group", &a.all_hosts_group),
+        ] {
+            if !valid_ad_group_name(n) {
+                bail!("{what}: letters, digits, '-', '_', '.' and inner blanks only (max 64)");
+            }
+        }
+        if !valid_ad_group_name(&a.access_group_prefix) {
+            bail!("ad.access_group_prefix: letters, digits, '-', '_', '.' and inner blanks only (max 64)");
+        }
+        if a.hosts_group.eq_ignore_ascii_case(&a.all_hosts_group) {
+            bail!("ad.hosts_group and ad.all_hosts_group must differ");
+        }
+        for (h, _) in &a.host_ipv4 {
+            if !crate::util::valid_hostname(h) || h != &h.to_ascii_lowercase() {
+                bail!("ad.host_ipv4: {h} is not a lower-case host name");
+            }
+        }
+        if !self.kerberos.password_only {
+            bail!("directory.backend = \"ad\" requires kerberos.password_only = true");
+        }
+        match &self.kerberos.verify_principal {
+            Some(v) if v.ends_with(&format!("@{}", self.kerberos.realm)) && !v.starts_with('@') => {}
+            _ => bail!("directory.backend = \"ad\" requires kerberos.verify_principal (e.g. host/<broker fqdn>@REALM)"),
+        }
+        if self.mac_admission.is_some() {
+            bail!("directory.backend = \"ad\" does not support mac_admission");
+        }
+        match &a.groups_base {
+            Some(b) if b.contains('=') && !b.trim().is_empty() => {}
+            _ => bail!("ad.groups_base (the OU holding the PLANK groups, as a DN) is required"),
+        }
+        if self.enrol.enabled {
+            bail!("directory.backend = \"ad\" requires enrol.enabled = false (enrolment is FreeIPA only)");
+        }
+        if self.limits.failures_per_user == 0 {
+            bail!("directory.backend = \"ad\" requires limits.failures_per_user > 0 (AD account lockout)");
+        }
+        if self.hosts.base_admission() != Admission::None {
+            bail!("directory.backend = \"ad\" requires hosts.admission = \"none\" (no plank/<host> Kerberos service)");
+        }
+        // AD's badPwdCount resets one observation window W after the LAST failure, so failures
+        // chain. The broker keeps its own (count, last) per user: at most N wrong passwords per
+        // quiet period W + margin, whatever their spacing. That is safe iff N < T.
+        let (Some(t), Some(w)) = (a.lockout_threshold, a.lockout_window_secs) else {
+            bail!("ad.lockout_threshold and ad.lockout_window_secs are required (the domain's lockout policy)");
+        };
+        if t == 0 || w == 0 {
+            bail!("ad.lockout_threshold / ad.lockout_window_secs must be positive (a domain without lockout needs no broker limit: set both from the real policy)");
+        }
+        if self.limits.failures_per_user >= t {
+            bail!(
+                "limits.failures_per_user ({}) must be below the AD lockout threshold ({t})",
+                self.limits.failures_per_user
+            );
+        }
+        if a.lockout_margin_secs < 10 {
+            bail!("ad.lockout_margin_secs must be at least 10 (the KDC answers and the counter resets are not instantaneous)");
+        }
+        if self.kerberos.login_timeout_secs == 0 || self.kerberos.login_timeout_secs > 120 {
+            bail!("kerberos.login_timeout_secs must be 1-120");
+        }
+        if let AdmissionPolicy::PerHost(m) = &self.hosts.admission {
+            if m.values().any(|v| *v != Admission::None) {
+                bail!("directory.backend = \"ad\": every hosts.admission entry must be \"none\"");
+            }
         }
         Ok(())
     }

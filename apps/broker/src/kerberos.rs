@@ -262,6 +262,9 @@ impl Kerberos for FakeKerberos {
         match self.users.get(username) {
             Some(s) if s.as_str() == secret.as_str() => Ok(self.ticket(opts)),
             _ if self.otp_login_ok(username, secret) => Ok(self.ticket(opts)),
+            None if !self.passwords.lock().unwrap().contains_key(username) => {
+                Err(KrbError::Denied("unknown principal: not found in Kerberos database".into()))
+            }
             _ => Err(KrbError::Denied("Preauthentication failed".into())),
         }
     }

@@ -103,3 +103,86 @@ device_proof_skew_secs = 60
 # ttl_secs = 30
 # [mac_admission.hosts]
 # "mac.example.org" = "artist"
+
+# ---------------------------------------------------------------------------
+# Active Directory. This block is a COMPLETE alternative config:
+# copy it to broker.toml and remove the leading "# ". It replaces every section
+# above (FreeIPA). See docs/fernweh/broker.md, "Active Directory".
+# ---------------------------------------------------------------------------
+# --- AD BEGIN
+# listen = "0.0.0.0:29000"
+# public_endpoint = "plank.example.org"        # the public DNS name of the forwarded IP
+#
+# [directory]
+# backend = "ad"
+#
+# [tls]
+# cert = "/etc/plank-broker/tls.crt"
+# key = "/etc/plank-broker/tls.key"
+#
+# [kerberos]
+# realm = "EXAMPLE.ORG"
+# # The broker VM's machine account from `adcli join` (default keytab entry NAME$).
+# principal = "BROKER$@EXAMPLE.ORG"
+# keytab = "/etc/plank-broker/broker.keytab"
+# password_only = true                         # plain password AS-REQ, no OTP list, no FAST
+# # Every login's TGT is verified against this keytab entry (krb5_verify_init_creds), so a
+# # spoofed KDC cannot accept arbitrary passwords. Use host/<broker fqdn>.
+# verify_principal = "host/broker.example.org@EXAMPLE.ORG"
+# login_timeout_secs = 10                      # default; how long a sign-in waits for the KDC
+# ticket_lifetime_secs = 36000
+# session_dir = "/var/lib/plank-broker/sessions"
+#
+# [ldap]
+# # The host name must be the DC's FQDN (it names ldap/<fqdn> and the certificate CN).
+# # If DNS cannot resolve it, add the DC's address for that name to /etc/hosts.
+# uris = ["ldaps://dc1.example.org:636"]
+# ca_cert = "/etc/plank-broker/ad-ca.pem"      # root of the internal CA (signed the DC certificate)
+# # base_dn = "dc=example,dc=org"            # default: derived from the realm
+# cache_ttl_secs = 60
+# timeout_secs = 5
+#
+# [ad]
+# hosts_group = "PLANK-Hosts"                  # computer group: the PLANK host inventory
+# access_group_prefix = "PLANK-"               # per-host access group: PLANK-<COMPUTERNAME>
+# all_hosts_group = "PLANK-AllHosts"           # members reach every host
+# # user_base = "OU=Staff,DC=example,DC=org"
+# computer_base = "OU=Workstations,DC=example,DC=org"
+# groups_base = "OU=PLANK,OU=Groups,DC=example,DC=org"   # REQUIRED: only security groups in this OU count
+# # The domain's lockout policy (for example, 5 bad passwords, 30 min observation window,
+# # 30 min lockout). REQUIRED: the broker keeps its own per-user counter that mirrors AD's
+# # (reset only W + margin after the LAST failure) and refuses limits that could reach it.
+# lockout_threshold = 5
+# lockout_window_secs = 1800
+# lockout_margin_secs = 60                     # default; added to the window
+# # [ad.host_ipv4]                             # optional: skip DNS for a host
+# # "ws01.example.org" = "192.0.2.51"
+#
+# [hosts]
+# port = 28989
+# probe_mode = "tls"                           # TLS 1.3 handshake, no client certificate
+# admission = "none"                           # hosts sign the user in themselves; empty gssapi_token
+# # Optional static certificate pins (SHA-256 of the leaf certificate DER); such a
+# # host is never TOFU-pinned:
+# # [hosts.static_pins]
+# # "ws01.example.org" = "<64 hex digits>"
+# pins_file = "/var/lib/plank-broker/pins.json"
+#
+# [relay]
+# socket = "/run/plank-broker/relay.sock"
+# port_min = 29001
+# port_max = 29100
+# allowed_target_cidrs = ["192.0.2.0/24"]      # the workstation network
+#
+# [limits]
+# failures_per_user_ip = 3
+# failures_per_ip = 10
+# # Wrong passwords per user from ANY address per quiet period (AD window + margin),
+# # counted before the KDC is asked. Must be below the AD lockout threshold.
+# failures_per_user = 3
+# block_secs = 900                             # per-IP blocks only; the per-user rule is the AD model
+# min_respond_ms = 1500
+#
+# [enrol]
+# enabled = false                              # enrolment and passkeys are FreeIPA only
+# --- AD END

@@ -501,6 +501,7 @@ impl Directory for IpaDirectory {
             disabled: attr(&e, "nsaccountlock").iter().any(|v| v.eq_ignore_ascii_case("TRUE")),
             groups: attr(&e, "memberof"),
             dn: e.dn,
+            pwd_last_set_unix: None,
         }))
     }
 

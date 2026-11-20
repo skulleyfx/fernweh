@@ -201,3 +201,128 @@ only after independently verifying replacement identity. Keep audit logs and
 session stores private; they contain operational metadata. Back up configuration
 and key material securely. Test rotation/revocation rather than treating a
 successful compile as proof of secure deployment.
+
+## Active Directory
+
+The broker can use Active Directory instead of FreeIPA (`[directory] backend = "ad"`).
+The FreeIPA backend is unchanged and stays the default. The complete AD example
+config is the commented block at the end of `apps/broker/packaging/broker.toml.example`.
+
+What changes with AD:
+
+- **Sign-in** is the AD user name and password only: a plain Kerberos AS exchange
+  against the domain controller (`kerberos.password_only = true`; no OTP, no FAST).
+  The second factor happens on the Host's own sign-in. Passkey sign-in, the enrolment
+  endpoints and `mac_admission` are not available (`enrol.enabled = false` is required).
+  Every login's TGT is verified against the broker keytab (`kerberos.verify_principal`,
+  `krb5_verify_init_creds` with `ap_req_nofail`), so a spoofed KDC cannot accept arbitrary
+  passwords. See "Pin the KDCs" below.
+- **Hosts** are the enabled computer accounts in the AD group `PLANK-Hosts`. A computer is
+  listed only when its `dNSHostName` starts with its own name (computer names over 15 characters fail this, because `sAMAccountName` is truncated to 15: they are skipped until the DNS host name's first label is set equal to the account name); if two computers claim one
+  host name both are dropped (logged).
+- **Access** is by security groups: members of `PLANK-<COMPUTERNAME>` reach that host
+  and members of `PLANK-AllHosts` reach all of them. Only security groups in
+  `ad.groups_base` (an OU) count, and a group name that occurs twice grants nothing (logged).
+  Nested groups count (the DC expands them with `LDAP_MATCHING_RULE_IN_CHAIN`). The user's
+  primary group (Domain Users) is not visible this way: never use it for access. Disabled,
+  expired, locked-out and password-expired users and disabled computers are refused, and a
+  session created before the user's latest `pwdLastSet` is ended.
+- **Admission** is `hosts.admission = "none"`: `connect` returns an empty `gssapi_token`
+  and `auth_method: "host_login"`; the client then signs in on the leased relay port with
+  its normal PLANK login. Hosts are probed by a TLS 1.3 handshake without a client
+  certificate (`probe_mode = "tls"`). **In production set `[hosts.static_pins]`** (SHA-256 of
+  each host's leaf certificate DER) **and/or `[ad.host_ipv4]`**: without them the first
+  certificate seen is trusted (TOFU) and addresses come from DNS, so whoever controls DNS
+  can redirect users.
+
+### Account lockout and the broker limits
+
+Every wrong password raises the account's `badPwdCount` in AD, which resets one observation
+window `W` only after the *last* failure: failures chain, so spacing them out never helps
+the account. The broker therefore mirrors AD's own counter. Per user (from any address) it
+keeps `(count, last failure)`; it counts an attempt *before* asking the KDC, stamps it again
+when the KDC has answered, allows one attempt per user at a time, and refunds the count when
+the password was right, when the principal is unknown, or when the KDC could not answer
+(unreachable, clock skew, TGT verification failed, account without AES keys). The count
+resets only after `W + ad.lockout_margin_secs` (default 60 s, at least 10) without a counted failure; once
+`N = limits.failures_per_user` wrong passwords are counted, that user is refused until then.
+So at most `N` wrong passwords reach AD per quiet period, whatever their spacing. A sign-in
+waits at most `kerberos.login_timeout_secs` (default 10) for the KDC; the attempt is counted
+by its real outcome anyway.
+
+Before the KDC is asked, the typed name must be an exact `sAMAccountName` of an enabled
+person account (looked up over LDAP, cached for `ldap.cache_ttl_secs`). Anything else, such
+as a UPN-prefix spelling the KDC would also accept, is denied without a KDC call and without
+being tracked, so one account cannot collect several counts under different spellings. If the
+lookup fails the sign-in is denied and not counted. A refusal by this per-user rule is never
+visible as a 429: the client gets the normal challenge and then the same generic denial (after
+`min_respond_ms`) as for a wrong password, so real and unknown names cannot be told apart.
+Only the per-IP limits answer 429.
+
+`ad.lockout_threshold` (`T`) and `ad.lockout_window_secs` (`W`) are required for the AD
+backend and the broker refuses to start unless `N < T`. An example policy (`T = 5`, `W = 30 min`,
+lockout duration 30 min, no fine-grained policies) uses `N = 3`; the two spare attempts cover
+typos at the Windows sign-in (those count in AD but not here). A password spray can still keep
+a user out of the broker (not of AD) for up to `W + margin` after the last wrong password.
+`limits.block_secs` and `limits.user_window_secs` do not apply to this per-user rule.
+
+The counters live in memory: a broker restart gives every user `N` fresh attempts. Do not
+restart the broker in a loop, and remember `T - N` is the only reserve for that case.
+Before going live check, on the LAN with a test account, that **one wrong password raises
+`badPwdCount` by exactly 1** (`Get-ADUser <name> -Server (Get-ADDomain).PDCEmulator -Properties badPwdCount`): `badPwdCount`
+is not replicated between domain controllers, so always query the PDC emulator, which the
+authoritative count follows. The doubled count
+UDP retransmissions can cause is avoided by `udp_preference_limit = 1` (TCP only, see the
+`krb5.conf` below). Do not set `primary_kdc` / `master_kdc`: libkrb5 may retry a failed
+password against the primary KDC, which would count twice.
+
+### Setup for an administrator
+
+1. **AD groups.** In one OU (`ad.groups_base`, for example `OU=PLANK,OU=Groups,DC=example,DC=org`) create the *security* group
+   `PLANK-Hosts` (add each workstation's computer account), one security group
+   `PLANK-<COMPUTERNAME>` per workstation (the computer's sAMAccountName without `$`) and
+   optionally `PLANK-AllHosts`. Add users or groups to them.
+2. **Broker VM.** Join it to the domain and create its keytab, as root on the VM:
+   `adcli join --domain=example.org --login-user=<domain admin> --host-keytab=/etc/plank-broker/broker.keytab`
+   (or `msktutil`), then `chown plank-broker:root` and `chmod 0400` the keytab.
+   `kerberos.principal` is the machine account entry (`NAME$@EXAMPLE.ORG`); the broker
+   binds to LDAP as exactly that principal (it takes a keytab ticket into its private
+   in-memory credential cache at start-up and refreshes it). `kerberos.verify_principal` is a
+   second keytab entry, `host/<broker fqdn>@EXAMPLE.ORG`. The machine account needs no special
+   rights: default read access to the directory is enough. Run
+   `plank-broker selftest directory --user <name>`: it first proves the keytab ticket works.
+3. **Pin the KDCs.** `/etc/krb5.conf` on the VM names the domain controllers and switches
+   DNS discovery off, so nobody can answer for the KDC:
+
+       [libdefaults]
+           default_realm = EXAMPLE.ORG
+           dns_lookup_kdc = false
+           dns_lookup_realm = false
+           rdns = false
+           udp_preference_limit = 1
+       [realms]
+           EXAMPLE.ORG = {
+               kdc = dc1.example.org
+           }
+       [domain_realm]
+           .example.org = EXAMPLE.ORG
+           example.org = EXAMPLE.ORG
+
+   Add one `kdc =` line per domain controller. No `primary_kdc` / `master_kdc`.
+4. **LDAPS.** Put the root of the CA that signed the DC certificate (for example `CN=Internal-CA`) in `ldap.ca_cert`; the DC certificate already has SAN `dc1.example.org`. The LDAP URI host
+   must be the DC's FQDN (`ldaps://dc1.example.org:636`), it names the `ldap/<fqdn>`
+   principal, and **the certificate needs a Subject Alternative Name (dNSName) equal to that
+   name**: a CN-only certificate is refused by rustls. Add an `/etc/hosts` line on the VM if
+   DNS cannot resolve the name. The bind runs over TLS with channel binding, with no Kerberos
+   security layer (works with LDAP signing negotiated, `LDAPServerIntegrity = 1`, and with
+   channel binding left at the OS default).
+5. **AES keys.** The domain functional level (2016) gives AES keys to accounts whose password was set since. Users must have AES Kerberos keys: AD accounts whose password was last set
+   when only RC4 existed, or accounts restricted to RC4, fail with "no support for encryption
+   type". The broker logs `etype_unsupported`, does not count it as a wrong password and
+   still denies the sign-in: reset the user's password (and enable AES for the account).
+6. **Firewall.** Forward one public IP to the broker VM: TCP 29000 (API) and TCP+UDP
+   29001-29100 (relay leases, `relay.port_min/port_max`). The broker VM must reach each
+   workstation on TCP+UDP 28989 and `relay.allowed_target_cidrs` must contain their network.
+7. **Check.** `plank-broker check-config`, then start the service as for FreeIPA
+   (see "Service installation"). Nothing in the config holds a secret: the keytab and
+   TLS key are separate files.

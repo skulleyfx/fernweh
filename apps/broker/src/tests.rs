@@ -140,7 +140,7 @@ fn harness_cfg(krb: FakeKerberos, tweak: impl FnOnce(&mut Config)) -> H {
         rule("plank_remote_bob", &[user("bob")], &[host("ws1")], &[svc("plank-remote")]),
     ]);
     let dir =
-        Arc::new(FakeDirectory::new(v, vec![("anna", anna()), ("bob", UserView { disabled: false, dn: user("bob"), groups: vec![] })]));
+        Arc::new(FakeDirectory::new(v, vec![("anna", anna()), ("bob", UserView { disabled: false, dn: user("bob"), groups: vec![], ..Default::default() })]));
     let krb = Arc::new(krb);
     let relay = Arc::new(FakeRelay::default());
     let prober = Arc::new(FakeProber {

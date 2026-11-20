@@ -75,6 +75,13 @@ struct KrbCreds {
     authdata: *mut *mut c_void,
 }
 
+/// `krb5_verify_init_creds_opt` (krb5.h): flags + ap_req_nofail.
+#[repr(C)]
+struct VerifyOpt {
+    flags: i32,
+    ap_req_nofail: c_int,
+}
+
 #[repr(C)]
 struct KrbPrompt {
     prompt: *mut c_char,
@@ -145,6 +152,16 @@ extern "C" {
         opt: KrbOpt,
     ) -> i32;
     fn krb5_free_cred_contents(ctx: KrbCtx, creds: *mut KrbCreds);
+    fn krb5_verify_init_creds_opt_init(opt: *mut VerifyOpt);
+    fn krb5_verify_init_creds_opt_set_ap_req_nofail(opt: *mut VerifyOpt, ap_req_nofail: c_int);
+    fn krb5_verify_init_creds(
+        ctx: KrbCtx,
+        creds: *mut KrbCreds,
+        server: KrbPrincipal,
+        keytab: KrbKeytab,
+        ccache: *mut KrbCcache,
+        opt: *mut VerifyOpt,
+    ) -> i32;
     fn krb5_get_error_message(ctx: KrbCtx, code: i32) -> *const c_char;
     fn krb5_free_error_message(ctx: KrbCtx, msg: *const c_char);
     fn krb5_get_prompt_types(ctx: KrbCtx) -> *mut i32;
@@ -258,8 +275,30 @@ const KRB5_REALM_UNKNOWN: i32 = -1765328230;
 /// count as a user's failed credential: that would feed the broker's per-user limiter and
 /// lock people out over a configuration error.
 fn is_unavailable(code: i32) -> bool {
-    matches!(code, KRB5_KDC_UNREACH | KRB5_REALM_CANT_RESOLVE | KRB5_REALM_UNKNOWN)
+    matches!(
+        code,
+        KRB5_KDC_UNREACH
+            | KRB5_REALM_CANT_RESOLVE
+            | KRB5_REALM_UNKNOWN
+            | KRB5KDC_ERR_ETYPE_NOSUPP
+            | KRB5_PROG_ETYPE_NOSUPP
+            | KRB5KRB_AP_ERR_SKEW
+            | KRB5KDC_ERR_SVC_UNAVAILABLE
+    )
 }
+
+/// Clock skew between this host and the KDC, or a KDC that says it is unavailable: our
+/// problem, never the user's wrong password.
+const KRB5KRB_AP_ERR_SKEW: i32 = -1765328347;
+const KRB5KDC_ERR_SVC_UNAVAILABLE: i32 = -1765328355;
+/// The client principal is not in the database: nothing for the lockout counter to count.
+const KRB5KDC_ERR_C_PRINCIPAL_UNKNOWN: i32 = -1765328378;
+
+/// The account (or KDC) has no encryption type we support, e.g. an AD account that only has
+/// RC4 keys. A configuration problem of that account, not a wrong password: it is reported as
+/// "unavailable" so it never counts toward the per-user block.
+const KRB5KDC_ERR_ETYPE_NOSUPP: i32 = -1765328370;
+const KRB5_PROG_ETYPE_NOSUPP: i32 = -1765328234;
 
 const KRB5_PROMPT_TYPE_PASSWORD: i32 = 1;
 const KRB5_PROMPT_TYPE_PREAUTH: i32 = 4;
@@ -298,7 +337,10 @@ impl Ctx {
         }
     }
     fn err(&self, code: i32, what: &str) -> KrbError {
-        let m = format!("{what}: {}", self.msg(code));
+        let mut m = format!("{what}: {}", self.msg(code));
+        if code == KRB5KDC_ERR_C_PRINCIPAL_UNKNOWN {
+            m = format!("unknown principal: {m}");
+        }
         if is_unavailable(code) {
             KrbError::Unavailable(m)
         } else {
@@ -481,6 +523,10 @@ pub struct MitKerberos {
     armor_ccache: String,
     /// End time of the current armour TGT (0 = none). Logins hold the read lock.
     armor: RwLock<u64>,
+    /// Active Directory: plain password AS exchange, no OTP list, no FAST.
+    password_only: bool,
+    /// Service principal whose keytab key authenticates the KDC's answer (AD mode).
+    verify_principal: Option<String>,
 }
 
 impl MitKerberos {
@@ -492,9 +538,23 @@ impl MitKerberos {
             host_service: cfg.host_service.clone(),
             ticket_lifetime: cfg.ticket_lifetime_secs as i32,
             session_dir: cfg.session_dir.clone(),
-            armor_ccache: format!("MEMORY:plank-broker-armor-{}", std::process::id()),
+            // AD mode: this keytab TGT doubles as the LDAP GSSAPI credential cache of the
+            // process (`KRB5CCNAME`, see `kerberos_env` in the binary), so the LDAP bind uses
+            // exactly `kerberos.principal`.
+            armor_ccache: if cfg.password_only {
+                format!("MEMORY:plank-broker-ldap-{}", std::process::id())
+            } else {
+                format!("MEMORY:plank-broker-armor-{}", std::process::id())
+            },
             armor: RwLock::new(0),
+            password_only: cfg.password_only,
+            verify_principal: cfg.verify_principal.clone(),
         }
+    }
+
+    /// True for the password-only (Active Directory) mode, which needs no FAST armour.
+    pub fn is_password_only(&self) -> bool {
+        self.password_only
     }
 
     /// Obtain / refresh the FAST armour TGT from the keytab.
@@ -634,6 +694,32 @@ impl MitKerberos {
         Ok(())
     }
 
+    /// `krb5_verify_init_creds` against the broker keytab with `ap_req_nofail`.
+    fn verify_creds(&self, ctx: &Ctx, creds: &mut KrbCreds) -> Result<(), KrbError> {
+        let Some(name) = &self.verify_principal else {
+            return Err(KrbError::Unavailable("kerberos.verify_principal is not configured".into()));
+        };
+        let server = Princ::parse(ctx, name)?;
+        let ktname = CString::new(self.keytab.clone()).unwrap();
+        let mut kt = ptr::null_mut();
+        let rc = unsafe { krb5_kt_resolve(ctx.0, ktname.as_ptr(), &mut kt) };
+        if rc != 0 {
+            return Err(KrbError::Unavailable(format!("keytab: {}", ctx.msg(rc))));
+        }
+        let mut vopt = VerifyOpt { flags: 0, ap_req_nofail: 0 };
+        let rc = unsafe {
+            krb5_verify_init_creds_opt_init(&mut vopt);
+            krb5_verify_init_creds_opt_set_ap_req_nofail(&mut vopt, 1);
+            krb5_verify_init_creds(ctx.0, creds, server.1, kt, ptr::null_mut(), &mut vopt)
+        };
+        unsafe { krb5_kt_close(ctx.0, kt) };
+        if rc != 0 {
+            // Never a password failure: the user's password was already accepted.
+            return Err(KrbError::Unavailable(format!("TGT verification failed: {}", ctx.msg(rc))));
+        }
+        Ok(())
+    }
+
     fn user_ccache(&self, opts: LoginOptions) -> String {
         if opts.persistent {
             format!("FILE:{}/pb-{}.ccache", self.session_dir.display(), random_hex(16))
@@ -676,8 +762,14 @@ impl Kerberos for MitKerberos {
         let rc = unsafe {
             set_ticket_opts(opt.1, self.ticket_lifetime, opts);
             let mut preauth = [KRB5_PADATA_OTP_CHALLENGE];
-            krb5_get_init_creds_opt_set_preauth_list(opt.1, preauth.as_mut_ptr(), preauth.len() as c_int);
-            let mut rc = krb5_get_init_creds_opt_set_fast_ccache_name(ctx.0, opt.1, armor.as_ptr());
+            let mut rc = 0;
+            if !self.password_only {
+                // FreeIPA: OTP pre-auth under FAST. Active Directory: a plain
+                // password AS-REQ (PA-ENC-TIMESTAMP); the prompter answers its
+                // single password prompt.
+                krb5_get_init_creds_opt_set_preauth_list(opt.1, preauth.as_mut_ptr(), preauth.len() as c_int);
+                rc = krb5_get_init_creds_opt_set_fast_ccache_name(ctx.0, opt.1, armor.as_ptr());
+            }
             if rc == 0 {
                 rc = krb5_get_init_creds_opt_set_out_ccache(ctx.0, opt.1, cc.1);
             }
@@ -699,6 +791,16 @@ impl Kerberos for MitKerberos {
         if rc != 0 {
             cc.destroy();
             return Err(ctx.err(rc, "AS exchange"));
+        }
+        if self.password_only {
+            // A spoofed KDC (or a poisoned DNS answer) could accept any password: check the
+            // TGT by getting a service ticket for our own keytab principal and decrypting
+            // it with the keytab key. Fails the login when that does not work.
+            if let Err(e) = self.verify_creds(&ctx, &mut creds) {
+                unsafe { krb5_free_cred_contents(ctx.0, &mut creds) };
+                cc.destroy();
+                return Err(e);
+            }
         }
         let ticket = ticket_of(ccname, &creds);
         unsafe { krb5_free_cred_contents(ctx.0, &mut creds) };

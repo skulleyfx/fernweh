@@ -26,7 +26,7 @@ use crate::kerberos::{Kerberos, KrbError, LoginOptions, UserTicket};
 use crate::passkey::{Assertion, Challenge, PromptData};
 use crate::pins::{PinCheck, PinStore};
 use crate::probe::Prober;
-use crate::ratelimit::RateLimiter;
+use crate::ratelimit::{Attempt, RateLimiter};
 use crate::relay::{Relay, RelayRequest};
 use crate::sessions::{SessionRecord, SessionStore};
 use crate::util::{random_token, sha256, valid_username, Clock};
@@ -357,7 +357,7 @@ pub struct Broker {
     d: Deps,
     direct_nets: Vec<ipnet::Ipv4Net>,
     st: Mutex<State>,
-    limiter: Mutex<RateLimiter>,
+    limiter: Arc<Mutex<RateLimiter>>,
     status: RwLock<HashMap<String, HostStatus>>,
     view: tokio::sync::Mutex<Option<(Instant, Arc<DirectoryView>)>>,
     users: Mutex<HashMap<String, (Instant, Option<UserView>)>>,
@@ -375,6 +375,41 @@ const PROMPTS: [Prompt; 2] = [
     Prompt { id: "otp", style: "otp", text: "Authenticator code", passkey: None },
 ];
 
+/// A reserved per-user KDC attempt (see `RateLimiter::begin_attempt`). Owned, so the login
+/// task can finish it after the HTTP request is gone; dropped unfinished it stays counted.
+struct AttemptGuard {
+    limiter: Arc<Mutex<RateLimiter>>,
+    clock: Arc<dyn crate::util::Clock>,
+    user: String,
+    attempt: Option<Attempt>,
+    done: bool,
+}
+
+impl AttemptGuard {
+    fn finish(mut self, counted: bool) {
+        self.done = true;
+        let now = self.clock.now();
+        self.limiter.lock().unwrap().end_attempt(&self.user, self.attempt, counted, now);
+    }
+}
+
+impl Drop for AttemptGuard {
+    fn drop(&mut self) {
+        if !self.done {
+            let now = self.clock.now();
+            self.limiter.lock().unwrap().end_attempt(&self.user, self.attempt, true, now);
+        }
+    }
+}
+
+/// Only a wrong password feeds the directory's lockout counter: not a right one, not an
+/// infrastructure problem and not a principal the directory does not know.
+fn counts_as_wrong_password(res: &Result<UserTicket, KrbError>) -> bool {
+    matches!(res, Err(KrbError::Denied(m)) if !m.starts_with("unknown principal"))
+}
+
+const PROMPTS_AD: [Prompt; 1] = [Prompt { id: "password", style: "secret", text: "Password", passkey: None }];
+
 fn v4(ip: IpAddr) -> Option<Ipv4Addr> {
     match ip {
         IpAddr::V4(a) => Some(a),
@@ -384,7 +419,12 @@ fn v4(ip: IpAddr) -> Option<Ipv4Addr> {
 
 impl Broker {
     pub fn new(cfg: Config, d: Deps) -> Arc<Broker> {
-        let limiter = RateLimiter::new(&cfg.limits);
+        let mut limiter = RateLimiter::new(&cfg.limits);
+        if cfg.directory.backend == crate::config::DirectoryBackend::Ad {
+            // AD's bad-password counter resets one observation window after the last failure.
+            let w = cfg.ad.lockout_window_secs.unwrap_or(0) + cfg.ad.lockout_margin_secs;
+            limiter = limiter.with_user_reset(Duration::from_secs(w));
+        }
         let st = State { next_port: cfg.relay.port_min, ..Default::default() };
         let direct_nets = cfg.routing.direct_nets();
         let passkey_rp_id = cfg.passkey.rp_id(&cfg.kerberos.realm);
@@ -394,7 +434,7 @@ impl Broker {
             d,
             direct_nets,
             st: Mutex::new(st),
-            limiter: Mutex::new(limiter),
+            limiter: Arc::new(Mutex::new(limiter)),
             status: RwLock::new(HashMap::new()),
             view: tokio::sync::Mutex::new(None),
             users: Mutex::new(HashMap::new()),
@@ -407,6 +447,11 @@ impl Broker {
 
     fn now(&self) -> Instant {
         self.d.clock.now()
+    }
+
+    /// Active Directory backend: password-only sign-in, no passkeys, no enrolment.
+    fn ad_mode(&self) -> bool {
+        self.cfg.directory.backend == crate::config::DirectoryBackend::Ad
     }
 
     fn audit(&self, ev: &str, f: serde_json::Value) {
@@ -459,7 +504,8 @@ impl Broker {
         let username = self.start_checks(ip, username)?;
         let conv = Conversation { username, ip, created: self.now(), auth: ConvAuth::PasswordOtp, device };
         let id = self.insert_conversation(&mut self.st.lock().unwrap(), conv)?;
-        Ok(ChallengeReply { state: "challenge", conversation_id: id, prompts: PROMPTS.to_vec() })
+        let prompts = if self.ad_mode() { PROMPTS_AD.to_vec() } else { PROMPTS.to_vec() };
+        Ok(ChallengeReply { state: "challenge", conversation_id: id, prompts })
     }
 
     pub async fn auth_start_method(
@@ -471,6 +517,7 @@ impl Broker {
     ) -> Result<ChallengeReply, ApiError> {
         match method {
             Method::PasswordOtp => self.auth_start_device(ip, username, device),
+            Method::Passkey if self.ad_mode() => Err(ApiError::BadRequest),
             Method::Passkey => self.auth_start_passkey_device(ip, username, device).await,
         }
     }
@@ -681,12 +728,19 @@ impl Broker {
     ) -> Result<AuthenticatedReply, ApiError> {
         let m = Method::PasswordOtp;
         let (user, _, device) = self.take_conversation(ip, conversation_id, m)?;
-        let well_formed = responses.len() == 2
+        let ad = self.ad_mode();
+        let password_ok = !responses.is_empty()
             && !responses[0].is_empty()
             && responses[0].len() <= 1024
-            && !responses[0].contains('\0')
-            && (6..=10).contains(&responses[1].len())
-            && responses[1].bytes().all(|b| b.is_ascii_digit());
+            && !responses[0].contains('\0');
+        let well_formed = password_ok
+            && if ad {
+                responses.len() == 1
+            } else {
+                responses.len() == 2
+                    && (6..=10).contains(&responses[1].len())
+                    && responses[1].bytes().all(|b| b.is_ascii_digit())
+            };
         if !valid_username(&user) || !well_formed {
             self.fail(&user, ip, m, if well_formed { "username" } else { "malformed" });
             return Err(ApiError::Denied);
@@ -694,28 +748,84 @@ impl Broker {
         self.ensure_session_room().await?;
         let mut responses = responses.into_iter();
         let password = responses.next().expect("validated password response");
-        let otp = responses.next().expect("validated OTP response");
-        let mut secret = Zeroizing::new(String::with_capacity(password.len() + otp.len()));
+        // FreeIPA: password followed by the OTP code. AD: the password alone.
+        let mut secret = Zeroizing::new(String::with_capacity(password.len() + 10));
         secret.push_str(&password);
-        secret.push_str(&otp);
-        drop(otp);
+        if let Some(otp) = responses.next() {
+            secret.push_str(&otp);
+        }
+        // Count the attempt before the KDC sees it (pessimistic) and allow one in flight per
+        // user. If this future is dropped mid-call the attempt stays counted.
+        // Active Directory: only a real, enabled sAMAccountName (exact match) ever reaches the
+        // KDC. The KDC also accepts other spellings of an account (UPN prefix); each would get
+        // its own count and together they could lock the account. An unknown name is denied
+        // without a KDC call and without being tracked.
+        if ad {
+            match self.user(&user, false).await {
+                Ok(Some(u)) if !u.disabled => {}
+                Ok(_) => {
+                    self.fail(&user, ip, m, "unknown_or_disabled");
+                    return Err(ApiError::Denied);
+                }
+                Err(_) => {
+                    self.audit(
+                        "login_fail",
+                        json!({"user": user, "ip": ip.to_string(), "method": m.as_str(), "reason": "directory_unavailable"}),
+                    );
+                    return Err(ApiError::Denied);
+                }
+            }
+        }
+        // A refusal by the per-user rule must look exactly like a wrong password (generic
+        // denial after min_respond_ms, no 429): otherwise it would tell real names from unknown.
+        let reserved = self.limiter.lock().unwrap().begin_attempt(&user, self.now());
+        let reserved = match reserved {
+            Ok(r) => r,
+            Err(_) => {
+                self.fail(&user, ip, m, "user_limited");
+                return Err(ApiError::Denied);
+            }
+        };
+        let guard = AttemptGuard {
+            limiter: self.limiter.clone(),
+            clock: self.d.clock.clone(),
+            user: user.clone(),
+            attempt: reserved,
+            done: false,
+        };
         let krb = self.d.krb.clone();
         let u = user.clone();
         let opts = self.login_options(&device);
-        let res = tokio::task::spawn_blocking(move || krb.login(&u, &secret, opts))
-            .await
-            .unwrap_or_else(|_| Err(KrbError::Unavailable("login task panicked".into())));
+        // The login runs to its end in its own task (which owns the attempt), so a slow KDC
+        // cannot leave an uncounted request behind; the client waits at most login_timeout.
+        let (tx, rx) = tokio::sync::oneshot::channel();
+        tokio::spawn(async move {
+            let k = krb.clone();
+            let res = tokio::task::spawn_blocking(move || k.login(&u, &secret, opts))
+                .await
+                .unwrap_or_else(|_| Err(KrbError::Unavailable("login task panicked".into())));
+            guard.finish(counts_as_wrong_password(&res));
+            if let Err(Ok(t)) = tx.send(res) {
+                krb.destroy(&t.ccache); // nobody is waiting for this ticket any more
+            }
+        });
+        let res = match tokio::time::timeout(Duration::from_secs(self.cfg.kerberos.login_timeout_secs), rx).await {
+            Ok(Ok(r)) => r,
+            Ok(Err(_)) => Err(KrbError::Unavailable("login task ended without a result".into())),
+            Err(_) => Err(KrbError::Unavailable("login timed out".into())),
+        };
         let mut reply = self.finish_login(user.clone(), ip, m, res, device)?;
         // Only a fresh OTP proof can open this short-lived enrollment window.
         // IPA still authorizes the mapping write as the user, not the broker.
-        let allowed = self
-            .d
-            .dir
-            .enrol_facts(&user)
-            .await
-            .ok()
-            .flatten()
-            .is_some_and(|f| !f.disabled && f.auth_types.iter().any(|t| t == "passkey"));
+        let allowed = !ad
+            && self
+                .d
+                .dir
+                .enrol_facts(&user)
+                .await
+                .ok()
+                .flatten()
+                .is_some_and(|f| !f.disabled && f.auth_types.iter().any(|t| t == "passkey"));
         if allowed && reply.device_bound {
             let key = sha256(reply.session_token.as_bytes());
             if let Some(session) = self.st.lock().unwrap().sessions.get_mut(&key) {
@@ -800,9 +910,17 @@ impl Broker {
             }
             Err(KrbError::Unavailable(msg)) => {
                 error!("KDC unavailable: {msg}");
+                // Not a wrong password, so never counted: tell the operator which problem it is.
+                let reason = if msg.contains("TGT verification") {
+                    "kdc_unverified"
+                } else if msg.to_ascii_lowercase().contains("encryption type") {
+                    "etype_unsupported"
+                } else {
+                    "kdc_unavailable"
+                };
                 self.audit(
                     "login_fail",
-                    json!({"user": user, "ip": ip.to_string(), "method": m.as_str(), "reason": "kdc_unavailable"}),
+                    json!({"user": user, "ip": ip.to_string(), "method": m.as_str(), "reason": reason}),
                 );
                 return Err(ApiError::Denied);
             }
@@ -929,11 +1047,29 @@ impl Broker {
         expect: (&str, &str),
     ) -> Result<([u8; 32], String, String), ApiError> {
         let out = self.session_proof(bearer, expect).await?;
-        if self.user(&out.1, false).await?.is_none_or(|user| user.disabled) {
+        let user = self.user(&out.1, false).await?;
+        if user.as_ref().is_none_or(|user| user.disabled) {
             self.end_session(out.0, "account_revoked").await;
             return Err(ApiError::Unauthorized);
         }
+        if self.password_changed_since_login(&out.0, user.as_ref()) {
+            self.end_session(out.0, "password_changed").await;
+            return Err(ApiError::Unauthorized);
+        }
         Ok(out)
+    }
+
+    /// The password was set after this session's sign-in (beyond clock skew between the
+    /// directory and this host): the session belongs to the old password.
+    fn password_changed_since_login(&self, key: &[u8; 32], user: Option<&UserView>) -> bool {
+        const SKEW_SECS: u64 = 120;
+        let Some(changed) = user.and_then(|u| u.pwd_last_set_unix) else { return false };
+        self.st
+            .lock()
+            .unwrap()
+            .sessions
+            .get(key)
+            .is_some_and(|s| changed > s.created_unix.saturating_add(SKEW_SECS))
     }
 
     /// Validate a bearer (and its device proof) and bump its idle timer.
@@ -1169,7 +1305,14 @@ impl Broker {
             }
             Ok(h) => {
                 let hexh = hex::encode(h);
-                let mismatch = match self.d.pins.check(fqdn, &hexh) {
+                let static_pin = self.cfg.hosts.static_pins.get(fqdn);
+                let checked = match static_pin {
+                    // Administrator-supplied pin: compared directly, never TOFU-stored.
+                    Some(pin) if *pin == hexh => Ok(PinCheck::Match),
+                    Some(_) => Ok(PinCheck::Mismatch),
+                    None => self.d.pins.check(fqdn, &hexh),
+                };
+                let mismatch = match checked {
                     Ok(PinCheck::Pinned) => {
                         self.audit("pin_new", json!({"host": fqdn, "sha256": hexh}));
                         false
@@ -1179,7 +1322,7 @@ impl Broker {
                         if !prev_mismatch {
                             self.audit(
                                 "pin_mismatch",
-                                json!({"host": fqdn, "presented": hexh, "pinned": self.d.pins.get(fqdn)}),
+                                json!({"host": fqdn, "presented": hexh, "pinned": static_pin.cloned().or_else(|| self.d.pins.get(fqdn))}),
                             );
                         }
                         true
@@ -1467,6 +1610,7 @@ impl Broker {
         // above apply to both methods. Shared Mac users never receive an OS password.
         let mac = self.cfg.mac_admission.as_ref()
             .and_then(|cfg| cfg.hosts.get(host).map(|local| (cfg.clone(), local.clone())));
+        let host_login = mac.is_none() && self.cfg.hosts.admission_for(host) == crate::config::Admission::None;
         let (gssapi_token, broker_token, local_username) = if let Some((cfg, local)) = mac {
             let issued = self.d.clock.unix();
             let host = host.to_string();
@@ -1479,6 +1623,10 @@ impl Broker {
             .map_err(|_| ApiError::Internal("Mac admission unavailable"))?
             .map_err(|_| ApiError::Internal("Mac admission unavailable"))?;
             (String::new(), Some(token), Some(local))
+        } else if host_login {
+            // Admission `none`: the Host authenticates the client itself (its own
+            // sign-in); no ticket is requested and none is returned.
+            (String::new(), None, None)
         } else {
             let krb = self.d.krb.clone();
             let fq = host.to_string();
@@ -1502,7 +1650,13 @@ impl Broker {
             };
             (STANDARD.encode(tok), None, None)
         };
-        let auth_method = broker_token.as_ref().map(|_| "broker_capability");
+        let auth_method = if broker_token.is_some() {
+            Some("broker_capability")
+        } else if host_login {
+            Some("host_login")
+        } else {
+            None
+        };
 
         let now = self.now();
         let initial = self.cfg.relay.lease_initial_secs;
@@ -1687,6 +1841,12 @@ impl Broker {
             .map(|(key, session)| (*key, session.username.clone()))
             .collect();
         for (key, user) in sessions {
+            if let Ok(Some(u)) = self.user(&user, false).await {
+                if self.password_changed_since_login(&key, Some(&u)) {
+                    self.end_session(key, "password_changed").await;
+                    continue;
+                }
+            }
             let Ok((_, assigned)) = self.assigned(&user, false).await else { continue };
             let revoked = {
                 let st = self.st.lock().unwrap();

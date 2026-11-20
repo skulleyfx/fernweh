@@ -50,13 +50,16 @@ pub struct DirectoryView {
     pub group_parents: HashMap<String, Vec<String>>,
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Default)]
 pub struct UserView {
     /// Administrative account lock, independent of ticket renewal.
     pub disabled: bool,
     pub dn: String,
     /// Group DNs as read from the directory (direct or already transitive).
     pub groups: Vec<String>,
+    /// When the password was last set (unix seconds), if the directory tells. A session
+    /// created before this (beyond clock skew) is ended.
+    pub pwd_last_set_unix: Option<u64>,
 }
 
 /// Transitive closure of `start` over `parents`.
@@ -179,7 +182,7 @@ pub(crate) mod fixtures {
     }
 
     pub fn anna() -> UserView {
-        UserView { disabled: false, dn: user("anna"), groups: vec![group("artists")] }
+        UserView { disabled: false, dn: user("anna"), groups: vec![group("artists")], ..Default::default() }
     }
 }
 
@@ -196,7 +199,7 @@ mod tests {
     fn direct_user_direct_host() {
         let v = view(vec![rule("plank_remote_anna", &[user("anna")], &[host("ws1")], &svc_remote())]);
         assert_eq!(assigned_hosts(&v, &anna()), vec!["ws1.example.org"]);
-        let bob = UserView { disabled: false, dn: user("bob"), groups: vec![] };
+        let bob = UserView { disabled: false, dn: user("bob"), groups: vec![], ..Default::default() };
         assert!(assigned_hosts(&v, &bob).is_empty());
     }
 

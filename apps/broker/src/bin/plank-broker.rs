@@ -91,6 +91,8 @@ fn init_tracing() {
 /// private memory cache. Must run before any thread exists.
 #[cfg(feature = "system")]
 fn kerberos_env(cfg: &Config) {
+    // AD mode: `MitKerberos` fills this same cache with a keytab ticket for `kerberos.principal`,
+    // which makes it the LDAP GSSAPI credential (the default principal of the cache).
     std::env::set_var("KRB5_CLIENT_KTNAME", format!("FILE:{}", cfg.kerberos.keytab.display()));
     std::env::set_var("KRB5CCNAME", format!("MEMORY:plank-broker-ldap-{}", std::process::id()));
 }
@@ -147,11 +149,20 @@ fn main() -> Result<()> {
     }
 }
 
+/// FreeIPA (default) or Active Directory, by `directory.backend`.
+#[cfg(feature = "system")]
+fn make_directory(cfg: &Config) -> Result<Arc<dyn plank_broker::directory::Directory>> {
+    use plank_broker::config::DirectoryBackend;
+    Ok(match cfg.directory.backend {
+        DirectoryBackend::Freeipa => Arc::new(plank_broker::ldap::IpaDirectory::new(cfg)?),
+        DirectoryBackend::Ad => Arc::new(plank_broker::ad::AdDirectory::new(cfg)?),
+    })
+}
+
 #[cfg(feature = "system")]
 async fn serve(cfg: Config) -> Result<()> {
     use plank_broker::audit::Audit;
     use plank_broker::broker::{Broker, Deps};
-    use plank_broker::ldap::IpaDirectory;
     use plank_broker::mit::MitKerberos;
     use plank_broker::probe::TlsProber;
     use plank_broker::relay::UnixRelay;
@@ -162,13 +173,31 @@ async fn serve(cfg: Config) -> Result<()> {
     {
         let k = krb.clone();
         match tokio::task::spawn_blocking(move || k.refresh_armor(true)).await? {
+            Ok(()) if krb.is_password_only() => {
+                info!("keytab ticket for {} obtained (LDAP GSSAPI credential)", cfg.kerberos.principal)
+            }
             Ok(()) => info!("FAST armour ticket obtained for {}", cfg.kerberos.principal),
-            Err(e) => error!("FAST armour: {e} (logins fail until this works)"),
+            Err(e) => error!("keytab ticket for {}: {e} (logins and directory reads fail until this works)", cfg.kerberos.principal),
         }
+    }
+    if krb.is_password_only() {
+        // The keytab TGT is also the process's LDAP credential cache: keep it fresh.
+        let k = krb.clone();
+        tokio::spawn(async move {
+            loop {
+                tokio::time::sleep(Duration::from_secs(300)).await;
+                let k2 = k.clone();
+                match tokio::task::spawn_blocking(move || k2.refresh_armor(false)).await {
+                    Ok(Ok(())) => {}
+                    Ok(Err(e)) => warn!("keytab ticket refresh: {e}"),
+                    Err(e) => warn!("keytab ticket refresh: {e}"),
+                }
+            }
+        });
     }
     let deps = Deps {
         krb,
-        dir: Arc::new(IpaDirectory::new(&cfg)?),
+        dir: make_directory(&cfg)?,
         relay: Arc::new(UnixRelay { socket: cfg.relay.socket.clone() }),
         prober: Arc::new(TlsProber::new(Duration::from_secs(cfg.hosts.probe_timeout_secs))?),
         pins: Arc::new(PinStore::open(&cfg.hosts.pins_file)?),
@@ -261,13 +290,19 @@ async fn selftest(cfg: Config, cmd: SelftestCmd) -> Result<()> {
     use std::os::unix::fs::OpenOptionsExt;
 
     use base64::Engine;
-    use plank_broker::directory::Directory;
     use plank_broker::hbac::assigned_hosts;
     use plank_broker::kerberos::{Kerberos, LoginOptions};
     use plank_broker::probe::{Prober, TlsProber};
     use zeroize::Zeroizing;
 
-    let dir = plank_broker::ldap::IpaDirectory::new(&cfg)?;
+    if cfg.kerberos.password_only {
+        // The LDAP bind uses kerberos.principal's keytab ticket: prove it works first.
+        let krb = Arc::new(plank_broker::mit::MitKerberos::new(&cfg.kerberos));
+        let k = krb.clone();
+        tokio::task::spawn_blocking(move || k.refresh_armor(true)).await?.map_err(|e| anyhow::anyhow!("{e}"))?;
+        println!("keytab ticket ok for {}", cfg.kerberos.principal);
+    }
+    let dir = make_directory(&cfg)?;
     match cmd {
         SelftestCmd::Directory { user } => {
             let v = dir.view().await.map_err(|e| anyhow::anyhow!("{e}"))?;
@@ -287,6 +322,13 @@ async fn selftest(cfg: Config, cmd: SelftestCmd) -> Result<()> {
                 println!("remote host {} ipv4={:?}", h.fqdn, h.ipv4);
             }
             if let Some(u) = user {
+                if cfg.directory.backend == plank_broker::config::DirectoryBackend::Ad {
+                    let ad = plank_broker::ad::AdDirectory::new(&cfg)?;
+                    match ad.account_report(&u).await {
+                        Ok(r) => println!("{r}"),
+                        Err(e) => println!("account attributes: {e}"),
+                    }
+                }
                 match dir.user(&u).await.map_err(|e| anyhow::anyhow!("{e}"))? {
                     None => println!("user {u}: not found"),
                     Some(uv) => {
@@ -297,7 +339,8 @@ async fn selftest(cfg: Config, cmd: SelftestCmd) -> Result<()> {
                 // Enrolment gate reads as the broker principal (§16). Tokens of other
                 // users are invisible without the "read OTP token ownership" permission,
                 // so 0 tokens for a user who has one means that permission is missing.
-                match dir.enrol_facts(&u).await {
+                let ad = cfg.directory.backend == plank_broker::config::DirectoryBackend::Ad;
+                match if ad { Ok(None) } else { dir.enrol_facts(&u).await } {
                     Err(e) => println!("enrolment facts: {e}"),
                     Ok(None) => {}
                     Ok(Some(f)) => {

@@ -86,7 +86,7 @@ fn harness_cfg(tweak: impl FnOnce(&mut Config)) -> E {
             f.insert(u.to_string(), fx);
             pw.insert(u.to_string(), ONE_TIME.to_string());
             dir.users.lock().unwrap().insert(u.to_string(), crate::hbac::UserView {
-                disabled: false, dn: user(u), groups: vec![],
+                disabled: false, dn: user(u), groups: vec![], ..Default::default()
             });
         };
         add("carol", facts(&clock, "carol", &["fernweh", "staff"], DAY, true));
