@@ -48,6 +48,38 @@ pub struct Config {
     /// Beta-only diagnostic collection, disabled unless explicitly configured.
     #[serde(default)]
     pub diagnostics: Option<crate::diagnostics::Config>,
+    /// Local admin status socket (read-only, Unix socket only). Absent = off.
+    #[serde(default)]
+    pub admin: Option<AdminConfig>,
+    /// Per-host PNG images shown in client host lists. Absent = off.
+    #[serde(default)]
+    pub thumbnails: Option<ThumbnailConfig>,
+}
+
+/// `[admin]`: the local status API (`admin.rs`). Never reachable over TCP.
+#[derive(Debug, Clone, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct AdminConfig {
+    /// Unix socket path, inside a directory dedicated to it.
+    pub socket: PathBuf,
+    /// The only local user whose processes may talk to the socket.
+    #[serde(default = "d_admin_user")]
+    pub api_user: String,
+    /// Optional group given to the socket (and its directory) so `api_user`
+    /// can reach it. The broker must be a member of that group.
+    #[serde(default)]
+    pub socket_group: Option<String>,
+}
+
+fn d_admin_user() -> String {
+    "plank-admin".into()
+}
+
+/// `[thumbnails]`: `<directory>/<hostname-lowercase>.png`.
+#[derive(Debug, Clone, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ThumbnailConfig {
+    pub directory: PathBuf,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize, Default)]
@@ -684,6 +716,16 @@ impl Config {
         if let Some(diagnostics) = &self.diagnostics {
             if !diagnostics.directory.is_absolute() || diagnostics.enabled_until_unix == 0 {
                 bail!("diagnostics requires an absolute directory and an explicit beta expiry");
+            }
+        }
+        if let Some(admin) = &self.admin {
+            if !admin.socket.is_absolute() || admin.api_user.is_empty() {
+                bail!("admin requires an absolute socket path and a non-empty api_user");
+            }
+        }
+        if let Some(t) = &self.thumbnails {
+            if !t.directory.is_absolute() {
+                bail!("thumbnails.directory must be absolute");
             }
         }
         if let Some(updates) = &self.client_updates {

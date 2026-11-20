@@ -5,6 +5,7 @@
 //! * `plank-broker-relay` — CAP_NET_ADMIN helper owning the nftables DNAT leases.
 
 pub mod ad;
+pub mod admin;
 pub mod api;
 pub mod audit;
 pub mod broker;
@@ -27,6 +28,7 @@ pub mod probe;
 pub mod ratelimit;
 pub mod relay;
 pub mod sessions;
+pub mod thumbs;
 pub mod totp;
 pub mod updates;
 pub mod util;

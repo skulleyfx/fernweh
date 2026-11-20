@@ -31,6 +31,7 @@ use crate::relay::{Relay, RelayRequest};
 use crate::sessions::{SessionRecord, SessionStore};
 use crate::util::{random_token, sha256, valid_username, Clock};
 
+mod admin_view;
 mod enrol;
 pub use enrol::{EnrolPrompt, EnrolReply, EnrolStartReply};
 
@@ -126,6 +127,18 @@ pub struct HostEntry {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub shared_desktop: Option<bool>,
     pub reason: Option<String>,
+    /// SHA-256 (hex) of the host's image, present only when a valid one is configured.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub image_sha256: Option<String>,
+}
+
+/// `GET /v1/hosts/{id}/image`: a small PNG, base64 inside the usual JSON.
+#[derive(Debug, Serialize)]
+pub struct ImageReply {
+    #[serde(rename = "type")]
+    pub kind: &'static str,
+    pub sha256: String,
+    pub data: String,
 }
 
 #[derive(Debug, Serialize)]
@@ -173,6 +186,8 @@ pub enum ApiError {
     BadRequest,
     /// Directory / KDC / relay failure.
     Internal(&'static str),
+    /// No such resource for this caller (never says whether it exists for others).
+    NotFound,
 }
 
 // ---------------------------------------------------------------- state
@@ -368,6 +383,7 @@ pub struct Broker {
     enrol: Mutex<HashMap<String, enrol::EnrolConv>>,
     /// Enrolment password proofs per user in the last 24 h (`enrol.daily_cap`).
     enrol_daily: Mutex<HashMap<String, std::collections::VecDeque<Instant>>>,
+    thumbs: Option<crate::thumbs::Thumbs>,
 }
 
 const PROMPTS: [Prompt; 2] = [
@@ -428,6 +444,7 @@ impl Broker {
         let st = State { next_port: cfg.relay.port_min, ..Default::default() };
         let direct_nets = cfg.routing.direct_nets();
         let passkey_rp_id = cfg.passkey.rp_id(&cfg.kerberos.realm);
+        let thumbs = cfg.thumbnails.as_ref().map(|t| crate::thumbs::Thumbs::new(t.directory.clone()));
         Arc::new(Broker {
             cfg,
             diagnostic_writer: Arc::new(tokio::sync::Semaphore::new(1)),
@@ -442,6 +459,7 @@ impl Broker {
             passkey_rp_id,
             enrol: Mutex::new(HashMap::new()),
             enrol_daily: Mutex::new(HashMap::new()),
+            thumbs,
         })
     }
 
@@ -1382,6 +1400,7 @@ impl Broker {
             shared_desktop: self.cfg.mac_admission.as_ref()
                 .filter(|cfg| cfg.hosts.contains_key(fqdn)).map(|_| true),
             reason: reason.map(str::to_string),
+            image_sha256: self.thumbs.as_ref().and_then(|t| t.image(fqdn)).map(|i| i.sha256.clone()),
         }
     }
 
@@ -1473,6 +1492,19 @@ impl Broker {
             self.refresh_leases(key, c, None).await;
         }
         Ok(HostsReply { hosts })
+    }
+
+    /// The caller's own host image. 404 unless the host is in the caller's
+    /// assigned list and has a valid image (same visibility rule as `list_hosts`).
+    pub async fn host_image<'a>(&self, bearer: impl Into<Bearer<'a>>, host: &str) -> Result<ImageReply, ApiError> {
+        let path = format!("/v1/hosts/{host}/image");
+        let (_, user, _) = self.session(bearer, ("GET", &path)).await?;
+        let (_, hosts) = self.assigned(&user, false).await?;
+        if !hosts.iter().any(|h| h == host) {
+            return Err(ApiError::NotFound);
+        }
+        let img = self.thumbs.as_ref().and_then(|t| t.image(host)).ok_or(ApiError::NotFound)?;
+        Ok(ImageReply { kind: "image/png", sha256: img.sha256.clone(), data: STANDARD.encode(&img.bytes) })
     }
 
     async fn refresh_leases(&self, key: [u8; 32], client: Ipv4Addr, host: Option<&str>) -> usize {

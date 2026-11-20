@@ -15,6 +15,12 @@ RestartSec=2s
 # under the StateDirectory (sessions/, records + FILE: ccaches) and survive restarts.
 StateDirectory=plank-broker
 StateDirectoryMode=0700
+# Optional local admin socket ([admin] in broker.toml; absent = nothing is created
+# or listened on). The broker joins plank-admin-api so it may hand the socket and
+# this directory to that group; only the admin API user can then reach it.
+RuntimeDirectory=plank-broker-admin
+RuntimeDirectoryMode=0750
+SupplementaryGroups=plank-admin-api
 UMask=0077
 LimitNOFILE=8192
 

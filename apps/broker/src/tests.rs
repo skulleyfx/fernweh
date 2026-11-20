@@ -2159,3 +2159,268 @@ async fn mac_admission_direct_route_and_hbac_revocation_keep_existing_policy() {
     assert_eq!(h.b.connect(LAN, &token, WS1, "e").await.unwrap_err(), ApiError::Denied);
     assert_eq!(h.b.keepalive(LAN, &token, WS1).await.unwrap_err(), ApiError::Unauthorized);
 }
+
+// ------------------------------------------------------------ admin socket
+
+async fn admin_get(app: &axum::Router, method: &str, uri: &str) -> (StatusCode, serde_json::Value) {
+    let r = app.clone().oneshot(Request::builder().method(method).uri(uri).body(Body::empty()).unwrap()).await.unwrap();
+    let status = r.status();
+    assert_eq!(r.headers()["cache-control"], "no-store");
+    let body = axum::body::to_bytes(r.into_body(), 1 << 20).await.unwrap();
+    (status, serde_json::from_slice(&body).unwrap_or(serde_json::Value::Null))
+}
+
+#[tokio::test]
+async fn admin_status_lists_every_host_with_presence_grants_and_sessions() {
+    let h = harness();
+    let app = crate::admin::router(h.b.clone());
+    // bob is only assigned ws1; ws2 belongs to nobody who is signed in. Both are listed.
+    let token = h.login_from(IP, "bob", "hunter2", "654321").await.unwrap();
+    h.b.probe_all().await;
+    h.b.connect(IP, &token, WS1, "remote.example.org").await.unwrap();
+    h.b.presence(IP, &token, WS1, CONNECTION_A, 1, true).await.unwrap();
+    h.clock.advance(Duration::from_secs(7));
+    let (code, j) = admin_get(&app, "GET", "/v1/admin/status").await;
+    assert_eq!(code, StatusCode::OK);
+    assert_eq!(j["cache_ttl_secs"], h.cfg.ldap.cache_ttl_secs);
+    let hosts = j["hosts"].as_array().unwrap();
+    assert_eq!(hosts.len(), 2);
+    let ws1 = hosts.iter().find(|x| x["id"] == WS1).unwrap();
+    let ws2 = hosts.iter().find(|x| x["id"] == WS2).unwrap();
+    assert_eq!(ws1["online"], true);
+    assert_eq!(ws1["name"], "ws1");
+    assert_eq!(ws1["pin_mismatch"], false);
+    assert_eq!(ws1["checked_age_secs"], 7);
+    assert_eq!(ws1["connected_users"], serde_json::json!(["bob"]));
+    assert_eq!(ws1["grants"][0]["user"], "bob");
+    assert_eq!(ws1["grants"][0]["route"], "relay");
+    assert_eq!(ws1["grants"][0]["client"], "203.0.113.7");
+    assert!(ws1["grants"][0]["expires_in"].as_u64().unwrap() <= 30);
+    assert!(ws1.get("image_sha256").is_none());
+    assert_eq!(ws2["connected_users"], serde_json::json!([]));
+    assert_eq!(ws2["grants"], serde_json::json!([]));
+    assert_eq!(j["sessions"].as_array().unwrap().len(), 1);
+    assert_eq!(j["sessions"][0]["user"], "bob");
+    assert_eq!(j["sessions"][0]["age_secs"], 7);
+    // A host that is down shows why, even though nobody is assigned to it.
+    h.prober.certs.lock().unwrap().insert(WS2.into(), None);
+    h.b.probe_all().await;
+    let (_, j) = admin_get(&app, "GET", "/v1/admin/status").await;
+    let ws2 = j["hosts"].as_array().unwrap().iter().find(|x| x["id"] == WS2).unwrap().clone();
+    assert_eq!(ws2["online"], false);
+    assert_eq!(ws2["reason"], "offline");
+}
+
+#[tokio::test]
+async fn admin_user_reports_what_the_broker_assigns() {
+    let h = harness();
+    let app = crate::admin::router(h.b.clone());
+    let (code, j) = admin_get(&app, "GET", "/v1/admin/users/anna").await;
+    assert_eq!(code, StatusCode::OK);
+    assert_eq!(j["state"], "ok");
+    assert_eq!(j["hosts"], serde_json::json!([WS1, WS2]));
+    assert_eq!(j["groups"], serde_json::json!([crate::hbac::fixtures::group("artists")]));
+    let (_, j) = admin_get(&app, "GET", "/v1/admin/users/BOB").await;
+    assert_eq!(j["hosts"], serde_json::json!([WS1]), "names fold like sign-in");
+    let (code, j) = admin_get(&app, "GET", "/v1/admin/users/nobody").await;
+    assert_eq!((code, j["state"].clone()), (StatusCode::OK, serde_json::json!("not_found")));
+    h.dir.users.lock().unwrap().get_mut("bob").unwrap().disabled = true;
+    h.b.invalidate_caches().await;
+    let (_, j) = admin_get(&app, "GET", "/v1/admin/users/bob").await;
+    assert_eq!((j["state"].clone(), j["hosts"].clone()), (serde_json::json!("disabled"), serde_json::json!([])));
+    assert_eq!(admin_get(&app, "GET", "/v1/admin/users/bad%20name").await.0, StatusCode::BAD_REQUEST);
+    assert_eq!(admin_get(&app, "GET", "/v1/admin/users/").await.0, StatusCode::NOT_FOUND);
+    *h.dir.unavailable.lock().unwrap() = true;
+    h.b.invalidate_caches().await;
+    assert_eq!(admin_get(&app, "GET", "/v1/admin/users/anna").await.0, StatusCode::SERVICE_UNAVAILABLE);
+}
+
+#[tokio::test]
+async fn admin_refresh_drops_the_view_and_user_caches_and_only_that() {
+    let h = harness();
+    let app = crate::admin::router(h.b.clone());
+    let token = h.login_from(IP, "bob", "hunter2", "654321").await.unwrap();
+    let hosts = || async { admin_get(&app, "GET", "/v1/admin/users/bob").await.1["hosts"].clone() };
+    assert_eq!(hosts().await, serde_json::json!([WS1]));
+    // Give bob ws2 in the directory; the caches still serve the old answer.
+    h.dir.view.lock().unwrap().rules[1].member_hosts.push(crate::hbac::fixtures::host("ws2"));
+    assert_eq!(hosts().await, serde_json::json!([WS1]));
+    assert_eq!(admin_get(&app, "GET", "/v1/admin/refresh").await.0, StatusCode::METHOD_NOT_ALLOWED);
+    let (code, j) = admin_get(&app, "POST", "/v1/admin/refresh").await;
+    assert_eq!((code, j["state"].clone()), (StatusCode::OK, serde_json::json!("ok")));
+    assert_eq!(hosts().await, serde_json::json!([WS1, WS2]));
+    assert!(h.b.list_hosts(IP, &token).await.is_ok(), "sessions survive a refresh");
+    assert_eq!(h.b.list_hosts(IP, &token).await.unwrap().hosts.len(), 2);
+}
+
+#[tokio::test]
+async fn admin_socket_serves_only_the_api_uid() {
+    let h = harness();
+    let me = unsafe { libc::geteuid() };
+    let dir = std::env::temp_dir().join(format!("fernweh-admin-sock-{}", rand::random::<u64>()));
+    std::fs::create_dir_all(&dir).unwrap();
+    for (api_uid, served) in [(me, true), (me.wrapping_add(1), false)] {
+        let path = dir.join(format!("a{api_uid}.sock"));
+        let listener = tokio::net::UnixListener::bind(&path).unwrap();
+        let b = h.b.clone();
+        let task = tokio::spawn(crate::admin::serve_listener(b, listener, api_uid, std::future::pending()));
+        let mut s = tokio::net::UnixStream::connect(&path).await.unwrap();
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        let _ = s.write_all(b"GET /v1/admin/status HTTP/1.1\r\nHost: admin\r\nConnection: close\r\n\r\n").await;
+        let mut out = Vec::new();
+        let _ = s.read_to_end(&mut out).await;
+        let text = String::from_utf8_lossy(&out);
+        if served {
+            assert!(text.starts_with("HTTP/1.1 200"), "{text}");
+            assert!(text.contains("\"hosts\""));
+        } else {
+            assert!(text.is_empty(), "refused peers get no bytes: {text}");
+        }
+        task.abort();
+    }
+    std::fs::remove_dir_all(dir).unwrap();
+}
+
+#[test]
+fn admin_bind_refuses_foreign_files_and_unknown_users() {
+    let dir = std::env::temp_dir().join(format!("fernweh-admin-bind-{}", rand::random::<u64>()));
+    std::fs::create_dir_all(&dir).unwrap();
+    let cfg = |socket: std::path::PathBuf, user: &str| crate::config::AdminConfig {
+        socket,
+        api_user: user.into(),
+        socket_group: None,
+    };
+    let file = dir.join("not-a-socket");
+    std::fs::write(&file, b"keep me").unwrap();
+    let me = unsafe { std::ffi::CStr::from_ptr(libc::getpwuid(libc::geteuid()).as_ref().unwrap().pw_name) }
+        .to_string_lossy()
+        .into_owned();
+    assert!(crate::admin::bind(&cfg(file.clone(), &me)).is_err());
+    assert_eq!(std::fs::read(&file).unwrap(), b"keep me");
+    assert!(crate::admin::bind(&cfg(dir.join("x.sock"), "no-such-user-here")).is_err());
+    std::fs::remove_dir_all(dir).unwrap();
+}
+
+#[test]
+fn admin_and_thumbnail_config_is_optional_and_validated() {
+    let c = test_config();
+    assert!(c.admin.is_none() && c.thumbnails.is_none());
+    let base = include_str!("../packaging/broker.toml.example");
+    let with = |v: &str| Config::parse(&format!("{base}\n{v}\n"));
+    let c = with("[admin]\nsocket = \"/run/plank-broker-admin/admin.sock\"").unwrap();
+    assert_eq!(c.admin.unwrap().api_user, "plank-admin");
+    assert!(with("[admin]\nsocket = \"relative.sock\"").is_err());
+    assert!(with("[admin]\nsocket = \"/run/x.sock\"\nbogus = 1").is_err());
+    assert!(with("[thumbnails]\ndirectory = \"/var/lib/plank-thumbs\"").is_ok());
+    assert!(with("[thumbnails]\ndirectory = \"thumbs\"").is_err());
+}
+
+// ------------------------------------------------------------ host images
+
+fn thumb_dir() -> std::path::PathBuf {
+    let d = std::env::temp_dir().join(format!("fernweh-thumbs-api-{}", rand::random::<u64>()));
+    std::fs::create_dir_all(&d).unwrap();
+    d
+}
+
+fn harness_thumbs(dir: &std::path::Path) -> H {
+    let dir = dir.to_path_buf();
+    harness_cfg(FakeKerberos::new(&[("anna", "secret123456"), ("bob", "hunter2654321")]), move |cfg| {
+        cfg.thumbnails = Some(crate::config::ThumbnailConfig { directory: dir });
+    })
+}
+
+async fn get_image(app: &axum::Router, host: &str, token: Option<&str>) -> (StatusCode, serde_json::Value) {
+    let mut r = Request::builder().uri(format!("/v1/hosts/{host}/image")).extension(ConnectInfo(SocketAddr::new(IP, 1)));
+    if let Some(t) = token {
+        r = r.header("authorization", format!("Bearer {t}"));
+    }
+    let r = app.clone().oneshot(r.body(Body::empty()).unwrap()).await.unwrap();
+    assert_eq!(r.headers()["cache-control"], "no-store");
+    let status = r.status();
+    let body = axum::body::to_bytes(r.into_body(), 1 << 20).await.unwrap();
+    (status, serde_json::from_slice(&body).unwrap())
+}
+
+#[tokio::test]
+async fn host_image_field_only_for_a_valid_png() {
+    let d = thumb_dir();
+    let h = harness_thumbs(&d);
+    let token = h.login().await; // anna: ws1 and ws2
+    let listed = || async { serde_json::to_value(h.b.list_hosts(IP, &token).await.unwrap()).unwrap() };
+    let j = listed().await;
+    assert!(j["hosts"][0].get("image_sha256").is_none() && j["hosts"][1].get("image_sha256").is_none());
+
+    let good = crate::thumbs::test_png(128, 96, 1);
+    std::fs::write(d.join("ws1.png"), &good).unwrap();
+    let j = listed().await;
+    assert_eq!(j["hosts"][0]["image_sha256"], hex::encode(crate::util::sha256(&good)));
+    assert!(j["hosts"][1].get("image_sha256").is_none());
+
+    // Everything below must be ignored, not break the list.
+    let mut oversize = crate::thumbs::test_png(64, 64, 2);
+    oversize.resize(128 * 1024 + 1, 0);
+    for bad in [
+        oversize,
+        crate::thumbs::test_png(15, 64, 2),
+        crate::thumbs::test_png(64, 300, 2),
+        b"\x89PNG not really".to_vec(),
+        b"GIF89a".to_vec(),
+        Vec::new(),
+    ] {
+        std::fs::write(d.join("ws2.png"), &bad).unwrap();
+        let j = listed().await;
+        assert!(j["hosts"][1].get("image_sha256").is_none(), "{} bytes", bad.len());
+        assert_eq!(j["hosts"][1]["id"], WS2);
+    }
+    std::fs::remove_dir_all(d).unwrap();
+}
+
+#[tokio::test]
+async fn host_image_endpoint_auth_assignment_and_replacement() {
+    let d = thumb_dir();
+    let h = harness_thumbs(&d);
+    let first = crate::thumbs::test_png(64, 64, 1);
+    std::fs::write(d.join("ws1.png"), &first).unwrap();
+    std::fs::write(d.join("ws2.png"), crate::thumbs::test_png(64, 64, 9)).unwrap();
+    let app = crate::api::router(h.b.clone());
+    let bob = h.login_from(IP, "bob", "hunter2", "654321").await.unwrap(); // ws1 only
+
+    assert_eq!(get_image(&app, WS1, None).await.0, StatusCode::UNAUTHORIZED);
+    assert_eq!(get_image(&app, WS1, Some("garbage")).await.0, StatusCode::UNAUTHORIZED);
+    let (code, j) = get_image(&app, WS1, Some(&bob)).await;
+    assert_eq!(code, StatusCode::OK);
+    assert_eq!(j["type"], "image/png");
+    assert_eq!(j["sha256"], hex::encode(crate::util::sha256(&first)));
+    use base64::Engine;
+    assert_eq!(base64::engine::general_purpose::STANDARD.decode(j["data"].as_str().unwrap()).unwrap(), first);
+    assert_eq!(j.as_object().unwrap().len(), 3);
+    // ws2 has an image but is not bob's; unknown and malformed hosts look the same.
+    assert_eq!(get_image(&app, WS2, Some(&bob)).await, (StatusCode::NOT_FOUND, serde_json::json!({"state":"not_found"})));
+    assert_eq!(get_image(&app, "nosuch.example.org", Some(&bob)).await.0, StatusCode::NOT_FOUND);
+    assert_eq!(get_image(&app, "..%2Fetc", Some(&bob)).await.0, StatusCode::NOT_FOUND);
+    // Assigned but no (valid) image: 404 too.
+    std::fs::remove_file(d.join("ws1.png")).unwrap();
+    assert_eq!(get_image(&app, WS1, Some(&bob)).await.0, StatusCode::NOT_FOUND);
+
+    // Replacing the file changes the hash the list and the endpoint report.
+    std::fs::write(d.join("ws1.png"), &first).unwrap();
+    let before = get_image(&app, WS1, Some(&bob)).await.1["sha256"].clone();
+    std::thread::sleep(Duration::from_millis(50));
+    let second = crate::thumbs::test_png(64, 64, 2);
+    std::fs::write(d.join("ws1.png"), &second).unwrap();
+    let after = get_image(&app, WS1, Some(&bob)).await.1["sha256"].clone();
+    assert_ne!(before, after);
+    assert_eq!(after, hex::encode(crate::util::sha256(&second)));
+    let listed = serde_json::to_value(h.b.list_hosts(IP, &bob).await.unwrap()).unwrap();
+    assert_eq!(listed["hosts"][0]["image_sha256"], after);
+    std::fs::remove_dir_all(d).unwrap();
+}
+
+#[tokio::test]
+async fn host_image_endpoint_is_off_without_thumbnails_config() {
+    let h = harness();
+    let app = crate::api::router(h.b.clone());
+    let bob = h.login_from(IP, "bob", "hunter2", "654321").await.unwrap();
+    assert_eq!(get_image(&app, WS1, Some(&bob)).await.0, StatusCode::NOT_FOUND);
+}

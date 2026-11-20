@@ -186,3 +186,18 @@ device_proof_skew_secs = 60
 # [enrol]
 # enabled = false                              # enrolment and passkeys are FreeIPA only
 # --- AD END
+
+# --- OPTIONAL: local admin socket (read-only status for an admin page) ---
+# Absent = off. Never reachable over TCP; only processes of `api_user` are served
+# (checked by peer uid). Endpoints: GET /v1/admin/status, GET /v1/admin/users/<sam>,
+# POST /v1/admin/refresh (drops the directory caches).
+# [admin]
+# socket = "/run/plank-broker-admin/admin.sock"
+# api_user = "plank-admin"                     # default
+# socket_group = "plank-admin-api"             # socket and its directory are given this group
+
+# --- OPTIONAL: per-host images in client host lists ---
+# Absent = off. <directory>/<short host name, lower case>.png, a PNG of 16..256 px
+# per side and at most 128 KiB; anything else is ignored.
+# [thumbnails]
+# directory = "/var/lib/plank-thumbs"

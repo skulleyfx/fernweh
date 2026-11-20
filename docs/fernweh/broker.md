@@ -202,6 +202,60 @@ session stores private; they contain operational metadata. Back up configuration
 and key material securely. Test rotation/revocation rather than treating a
 successful compile as proof of secure deployment.
 
+## Admin socket
+
+An optional, read-only status API for a local admin page. It is off unless
+`[admin]` is configured (see the commented section at the end of
+`apps/broker/packaging/broker.toml.example`).
+
+- It listens on a Unix socket only, never on TCP. The broker is port-forwarded
+  to the internet; this interface is not.
+- Every connection is checked with the peer's uid before any request is read.
+  Only the uid of `admin.api_user` (default `plank-admin`) is served, not even
+  root. Other connections are closed without a reply.
+- `admin.socket_group` (for example `plank-admin-api`) gives the socket and its
+  directory to that group. The unit runs the broker with
+  `SupplementaryGroups=plank-admin-api` and `RuntimeDirectory=plank-broker-admin`
+  (mode 0750) so it may do that; add the API user to the group. The group is
+  created by the shipped `sysusers.d` file.
+- A socket or a user that cannot be set up stops the broker at start-up instead
+  of leaving the feature silently off.
+
+Endpoints (JSON, `Cache-Control: no-store`):
+
+| Request | Reply |
+| --- | --- |
+| `GET /v1/admin/status` | `generated_unix`, `cache_ttl_secs`, `hosts[]` and `sessions[]`. Each host (every member of the directory's host group, assigned to anyone or not) has `id`, `name`, `online`, `busy`, `reason`, `pin_mismatch`, `checked_age_secs`, `connected_users[]`, `grants[]` (`user`, `route` relay or direct, `client`, `expires_in`) and, when set, `image_sha256`. Each session has `user`, `age_secs`, `idle_secs`. |
+| `GET /v1/admin/users/{sam}` | `state` (`ok`, `disabled`, `not_found`), `groups[]` and `hosts[]`: what the broker itself would list for that user now, from the same caches sign-in uses. The name is folded to lower case like sign-in. |
+| `POST /v1/admin/refresh` | Drops the directory view and user caches so the next request reads the directory again. Sessions, leases and probe results are untouched. |
+
+There is no endpoint that ends a session, changes access or writes anything
+else. Host status is what the periodic probe last saw (`checked_age_secs`); the
+status call never probes.
+
+## Host images
+
+An optional small picture per host, shown on the client's host cards. Off unless
+`[thumbnails] directory` is set.
+
+- The file is `<directory>/<short host name in lower case>.png` (for
+  `ws01.example.org`: `ws01.png`). The broker only reads the directory; whatever
+  writes the files should write a temporary file and rename it into place.
+- Accepted: a regular file (symlinks are not followed) of at most 128 KiB with a
+  PNG signature and an IHDR chunk whose width and height are both 16 to 256
+  pixels. Anything else is ignored and logged once per file version. The broker
+  does not decode the image; clients decode it themselves and must check the
+  size and hash again.
+- Files are cached by (modification time, length). One `stat` per host per list
+  call; the file is read again only when either changes.
+- `GET /v1/hosts` adds `image_sha256` (hex SHA-256 of the file) to a host entry
+  only when a valid image exists. Older clients ignore the field.
+- `GET /v1/hosts/{id}/image` is authenticated exactly like `/v1/hosts` (bearer
+  and, for device-bound sessions, the device proof). It answers 404 unless the
+  host is in the caller's own list and has a valid image. The reply is
+  `{"type":"image/png","sha256":"<hex>","data":"<base64>"}`, under 256 KiB, so
+  clients reuse their pinned JSON path.
+
 ## Active Directory
 
 The broker can use Active Directory instead of FreeIPA (`[directory] backend = "ad"`).

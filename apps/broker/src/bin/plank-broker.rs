@@ -207,6 +207,8 @@ async fn serve(cfg: Config) -> Result<()> {
     };
     let listener = tokio::net::TcpListener::bind(cfg.listen).await.with_context(|| format!("bind {}", cfg.listen))?;
     let probe_every = Duration::from_secs(cfg.hosts.probe_interval_secs.max(1));
+    // Bind before anything else is started: a broken [admin] section stops the broker.
+    let admin = cfg.admin.clone().map(|a| plank_broker::admin::bind(&a).map(|s| (a.socket, s))).transpose()?;
     let broker = Broker::new(cfg, deps);
     broker.audit_start();
     // Device-bound sessions survive restarts (§14.3); their leases do not.
@@ -263,6 +265,21 @@ async fn serve(cfg: Config) -> Result<()> {
                     warn!("support diagnostics cleanup failed");
                 }
             }
+        });
+    }
+    if let Some((socket, sock)) = admin {
+        let b = broker.clone();
+        tokio::spawn(async move {
+            let mut term =
+                tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate()).expect("SIGTERM handler");
+            let stop = async {
+                tokio::select! {
+                    _ = term.recv() => {},
+                    _ = tokio::signal::ctrl_c() => {},
+                }
+            };
+            plank_broker::admin::serve(b, sock, stop).await;
+            let _ = std::fs::remove_file(socket);
         });
     }
     let shutdown = async {

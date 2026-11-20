@@ -37,6 +37,7 @@ impl IntoResponse for ApiError {
             ApiError::RateLimited(s) => (StatusCode::TOO_MANY_REQUESTS, json!({"state": "denied", "retry_after": s})),
             ApiError::Unavailable(r) => (StatusCode::CONFLICT, json!({"state": "unavailable", "reason": r})),
             ApiError::NoLease => (StatusCode::NOT_FOUND, json!({"state": "no_lease"})),
+            ApiError::NotFound => (StatusCode::NOT_FOUND, json!({"state": "not_found"})),
             ApiError::Exhausted => {
                 (StatusCode::SERVICE_UNAVAILABLE, json!({"state": "unavailable", "reason": "no free session port"}))
             }
@@ -351,6 +352,27 @@ async fn hosts(
     }
 }
 
+async fn host_image(
+    State(b): State<Arc<Broker>>,
+    Path(id): Path<String>,
+    uri: Uri,
+    h: HeaderMap,
+    body: Bytes,
+) -> Response {
+    let r = async {
+        let t = device_bearer(&h, "GET", uri.path(), &body)?;
+        if !valid_hostname(&id) {
+            return Err(ApiError::NotFound);
+        }
+        b.host_image(t, &id).await
+    }
+    .await;
+    match r {
+        Ok(r) => Json(r).into_response(),
+        Err(e) => e.into_response(),
+    }
+}
+
 async fn connect(
     State(b): State<Arc<Broker>>,
     ConnectInfo(ci): ConnectInfo<SocketAddr>,
@@ -485,6 +507,7 @@ pub fn router(b: Arc<Broker>) -> Router {
             post(crate::diagnostics::submit).layer(DefaultBodyLimit::max(crate::diagnostics::MAX_BODY)),
         )
         .route("/v1/hosts", get(hosts))
+        .route("/v1/hosts/{id}/image", get(host_image))
         .route("/v1/hosts/{id}/connect", post(connect))
         .route("/v1/hosts/{id}/keepalive", post(keepalive))
         .route("/v1/hosts/{id}/presence", post(presence))
